@@ -1,0 +1,373 @@
+---
+title: "knockffos application, p = 1000"
+author: 
+- Viviana GAVILANES
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    code_folding: hide
+    latex_engine: xelatex
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+source("functions/data_simulation.R")
+source("functions/gaussian_knockoffs.R")
+source("functions/stat_coef_diff.R")
+source("functions/knockoff_aggregation.R")
+source("functions/util.R")
+
+library(mvtnorm)
+library(PhenotypeSimulator)
+library(ROCR)
+library(ggplot2)
+```
+
+# Simulating and preparing Data
+## Phenotypes and genotypes simulation
+
+The simu_data fonction is used to simulate data following an autoregressive structure with a Toeplitz covariance matrix. The function generates synthetic data for a given number of observations (n) and variables (p) based on various parameters.
+```{r}
+# Simulations
+# Fixed n = 500, p/n \in \{1/2,1,2\} and p \in \{250,500,1000\}
+# Settings
+n <- 500
+p_vector <- c(250,500,1000)
+p <- 1000
+m <- 30 # run per settings
+r <- 0.25 # correlation parameter
+sprs <- 0.20 # ratio of the number of variables with non-zero coefficients over 
+# total coefficients
+eft <- 1 # value of non-zero coefficients
+semilla <- 1
+
+```
+
+```{r}
+sim.X <- simu_data(n,p,rho = r,  sparsity = sprs, seed =  semilla )
+genotypes <- sim.X$genotypes
+phenotypes <- sim.X$phenotypes
+causal.true <- sim.X$causal_true
+true_non_zero <- sim.X$non_zero 
+```
+
+# Pool GWAS data preparaton
+
+```{r}
+## Clustering of individuals in K pools based on the phenotypes
+K = 10 #number of clusters
+limits<-quantile(phenotypes,probs=seq(0,1,1/K))
+clusters<-as.factor(sapply(phenotypes,function(x){max(1,max(which(limits<x)))}))
+## Calculating allele frequency by pool
+library(dplyr)
+compute_group_MAFs <- function(df, groups) {
+  cbind(groups,df) %>% 
+    group_by(groups) %>% 
+    summarise_all(mean) %>%
+    select(-1)/2 # Careful about the mean ! We have to divide by 2 
+  # since there are 2n DNA strands
+}
+
+freq = compute_group_MAFs(data.frame(genotypes),as.factor(clusters))
+## Create a data matrix $X=Z*freq$
+# Change coding of classing from integer to binary
+Z<-nnet::class.ind(clusters)
+X = Z%*%as.matrix(freq)
+Y<-phenotypes[,1]
+rownames(X)<-rownames(phenotypes)
+```
+
+
+# BH and Bonferroni
+```{r}
+correction_methods <- c("BH", "bonferroni")
+
+# Perform multiple testing using T-test
+p_values <- rep(0, p)
+for (j in 1:p) {
+  fit <- lm(Y ~ X[, j])
+  t_stat <- coef(summary(fit))[2, "t value"]
+  p_values[j] <- 2 * pt(abs(t_stat), df = n - 2, lower.tail = FALSE)
+}
+
+# Apply correction methods
+
+adjusted_p_values_BH <- p.adjust(p_values, method = "BH")
+adjusted_p_values_bonferroni <- p.adjust(p_values, method = "bonferroni")
+
+
+present.results(adjusted_p_values_BH,causal.true)
+present.results(adjusted_p_values_bonferroni,causal.true)
+
+```
+
+
+# Knockoffs
+Model-X knockoff inference procedure.
+
+```{r}
+sim.distribution.sim.X <- estimate_distribution(X)
+mu <- sim.distribution.sim.X$mu
+sigma <- sim.distribution.sim.X$Sigma
+X_tilde <- gaussian_knockoff_generation(genotypes, mu, sigma)
+W <- stat_coef_diff(genotypes,X_tilde,Y, alpha = 0)
+
+pvalues <- empirical_pval(W, 1)
+plot(W, pch = 16, cex = 1, col=c("black","red")[causal.true+1])
+
+present.results(pvalues, causal.true, 0.3 )
+t <-  knockoff.threshold(W, fdr = 0.1, offset = 0)
+discoveries <- which(W >= t)
+causal_estimated <- rep(0, p)
+causal_estimated[discoveries] <- 1
+# Confusion table
+print(test.table<-table(causal_estimated,causal.true))
+print(FDP <- test.table[2,1]/sum(test.table[2,]))
+# Confusion table for given theshold of t = 0.25
+causal.estimated=p.adjust(pvalues,"BH")< 0.25
+print(test.table<-table(causal.estimated,causal.true))
+print(FDP <- test.table[2,1]/sum(test.table[2,]))
+```
+
+## Knockoffs with empirical p-values repetition for boxplots
+
+```{r}
+num_iterations <- 30
+FDP_values_knockoffs <- numeric(num_iterations)
+time_knockoffs <- numeric(num_iterations) 
+for (i in 1:num_iterations) {
+  start_time <- Sys.time()
+  X_tilde <- gaussian_knockoff_generation(genotypes, mu, sigma)
+  W <- stat_coef_diff(genotypes,X_tilde,Y, alpha = 0)
+  pvalues <- empirical_pval(W, 1)
+  #present.results(pvalues, causal.true, 0.3 )
+  
+  #windows()
+  #plot(W, pch = 16, cex = 1, col=c("black","red")[causal.true+1])
+  t <-  knockoff.threshold(W, fdr = 0.1, offset = 0)
+  discoveries <- which(W >= t)
+  causal_estimated <- rep(0, p)
+  causal_estimated[discoveries] <- 1
+  # Confusion table
+  test.table <- table(causal_estimated, causal.true)
+  
+  # FDR calculation
+  FDP <- test.table[2, 1] / sum(test.table[2,])
+  FDP_values_knockoffs[i] <- FDP
+    end_time <- Sys.time()
+  elapsed_time <- end_time - start_time
+  time_knockoffs[i] <- elapsed_time
+  print(paste("Knockoffs method iteration", i, "elapsed time:", elapsed_time))
+}
+
+boxplot(FDP_values_knockoffs)
+#print(test.table<-table(causal_estimated,causal.true))
+#print(FDP <- test.table[2,1]/sum(test.table[2,])) 
+
+# Average FDR over 30 iterations
+FDR_knockoffs <- mean(FDP_values_knockoffs)
+print(FDR_knockoffs)
+```
+
+## Knockoffs agregation implementation
+
+FDP : Bootstraps = 5 with Benjamini-Hochberg step-up 
+30 times for getting the FDR
+
+```{r}
+num_repetitions <- 30  # Number of bootstraps
+FDP_values_AKO <- numeric(num_repetitions)
+time_AKO <- numeric(num_repetitions) 
+#adjusted_p_values <- numeric(num_repetitions)
+pvalue_vectores <- vector("list", num_repetitions)
+#pvalue_adj_vectores <- numeric(num_repetitions)
+
+gamma = 0.5
+gamma_min = 0.05
+adaptive_aggregation = TRUE
+construct_method = 'equi'
+n_bootstraps  <- 5
+offset <- 0
+fdr_control = 'bhq' # Or bhy
+reshaping_function = NULL
+fdr <- 0.1
+
+for (i in 1:num_repetitions) {
+start_time <- Sys.time()
+pi_tilde <-  quantile_aggregation(
+  pvalues, gamma = gamma, gamma_min = gamma_min,
+  adaptive = adaptive_aggregation
+)
+
+
+X_tildes <- lapply(1:n_bootstraps, function(seed) {
+  gaussian_knockoff_generation(genotypes, mu, sigma)
+})
+
+ko_stats <- lapply(X_tildes, function(X_tilde) {
+  stat_coef_diff(genotypes, X_tilde, phenotypes)
+})
+
+pvals <- sapply(ko_stats, function(stat) {
+  empirical_pval(stat, offset)
+})
+
+aggregated_pval <- apply(pvals, 1, quantile_aggregation, gamma = gamma, 
+                         gamma_min = gamma_min, adaptive = adaptive_aggregation)
+
+threshold <- fdr_threshold(aggregated_pval, fdr = fdr, method = fdr_control, 
+                           reshaping_function = reshaping_function)
+
+selected <- which(aggregated_pval <= threshold)
+
+causal_estimated_agg <- rep(0, p)
+causal_estimated_agg[selected] <- 1
+#print(test.table<-table(causal_estimated_agg,causal.true))
+#print(FDP <- test.table[2,1]/sum(test.table[2,])) 
+causal_estimated_agg <- rep(0, p)
+causal_estimated_agg[selected] <- 1
+
+test.table <- table(causal_estimated_agg, causal.true)
+FDP <- test.table[2, 1] / sum(test.table[2,])
+FDP_values_AKO[i] <- FDP
+  end_time <- Sys.time()
+  elapsed_time <- end_time - start_time
+  time_AKO[i] <- elapsed_time
+  print(paste("Aggregated Knockoffs method iteration", i, "elapsed time:", elapsed_time))
+}
+
+boxplot(FDP_values_AKO)
+#print(test.table<-table(causal_estimated,causal.true))
+#print(FDP <- test.table[2,1]/sum(test.table[2,])) 
+
+# Average FDR over 30 iterations
+FDR_AKO <- mean(FDP_values_AKO)
+print(FDR_AKO)
+```
+
+
+## BHq
+
+```{r}
+
+num_repetitions <- 30
+
+# Correction methods
+correction_methods <- c("BH", "bonferroni")
+
+
+# Results storage
+fdr_values <- matrix(0, nrow = num_repetitions, ncol = length(correction_methods))
+fwer_values <- matrix(0, nrow = num_repetitions, ncol = length(correction_methods))
+time_BHqs <- numeric(num_repetitions)
+
+adjusted_p_values_general <- array(0, dim = c(p, length(correction_methods), num_repetitions))
+
+# Simulation loop
+for (repetition in 1:num_repetitions) {
+  start_time <- Sys.time()
+  # Generate data using simu_data function
+  sim_data <- simu_data(n, p, rho = 0.25, sparsity = 0.2)
+  X <- sim_data$genotypes
+  Y <- sim_data$phenotypes[, 1]
+  causal_true <- sim_data$causal_true
+  
+  # Perform T-test for each variable
+  p_values <- apply(X, 2, function(x) {
+    coef <- lm(Y ~ x)$coefficients[2]
+    se <- summary(lm(Y ~ x))$coefficients[2, 2]
+    t <- coef / se
+    # Calculate p-values from T-statistics
+    p_values <- 2 * pt(abs(t), df = n - 2, lower.tail = FALSE)
+    return(p_values)
+  })
+  
+  # Apply correction methods
+  for (method_idx in 1:length(correction_methods)) {
+    method <- correction_methods[method_idx]
+    adjusted_p_values <- p.adjust(p_values, method = method)
+    
+    # Compute TP, FP, TN, FN, FDP
+    true_null <- causal_true == 0
+    detected_null <- adjusted_p_values > 0.05
+    
+    TP <- sum(detected_null & true_null)
+    FP <- sum(detected_null & !true_null)
+    TN <- sum(!detected_null & !true_null)
+    FN <- sum(!detected_null & true_null)
+    
+    FDP <- FP / (FP + TP)
+    
+    # Calculate FDR and FWER
+    fdr_values[repetition, method_idx] <- FDP
+    fwer_values[repetition, method_idx] <- sum(adjusted_p_values < 0.05) / sum(true_null)
+    
+    adjusted_p_values_general[, method_idx, repetition] <- adjusted_p_values 
+      end_time <- Sys.time()
+    elapsed_time <- end_time - start_time
+    time_BHqs[i] <- elapsed_time
+  }
+}
+
+# Compute average FDR and FWER
+avg_fdr <- colMeans(fdr_values)
+avg_fwer <- colMeans(fwer_values)
+
+# Print results
+for (method_idx in 1:length(correction_methods)) {
+  method <- correction_methods[method_idx]
+  cat("Correction Method:", method, "\n")
+  cat("Average False Discovery Rate (FDR):", avg_fdr[method_idx], "\n")
+  cat("Average Family-wise Error Rate (FWER):", avg_fwer[method_idx], "\n\n")
+}
+```
+
+
+```{r}
+# Create a data frame to store the results
+method_results <- data.frame(
+  Method = c("BH", "Bonferroni", "Knockoffs", "Aggregated Knockoffs"),
+  Avg_FDR = c(avg_fdr[1], avg_fdr[2], FDR_knockoffs, FDR_AKO),
+  time_executed = c(sum(time_BHqs), sum(time_BHqs), sum(time_knockoffs), sum(time_AKO))
+)
+
+# Print the table
+print(method_results)
+```
+
+
+
+```{r}
+
+# Store FDP values for each method
+fdp_values <- list(
+  BH = fdr_values[, 1],
+  bonferroni = fdr_values[, 2],
+  Knockoffs = FDP_values_knockoffs,
+  "Aggregated Knockoffs" = FDP_values_AKO
+)
+
+# Convert fdp_values list to a data frame
+fdp_df <- data.frame(
+  Method = rep(names(fdp_values), sapply(fdp_values, length)),
+  FDP = unlist(fdp_values)
+)
+
+# Create a boxplot using ggplot2
+boxplot_plot <- ggplot(fdp_df, aes(x = Method, y = FDP)) +
+  geom_boxplot() +
+  labs(x = "Method", y = "False Discovery Proportion (FDP)") +
+  theme_minimal()
+
+# Display the boxplot
+print(boxplot_plot)
+
+
+```
+
